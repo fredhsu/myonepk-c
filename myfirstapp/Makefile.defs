@@ -1,0 +1,46 @@
+#------------------------------------------------------------------
+# Makefile - Make rules for ONE-P Sample applications
+#
+# Copyright (c) 2011-2012 by cisco Systems, Inc.
+# All rights reserved.
+#------------------------------------------------------------------
+ifeq ($(origin ONEP_SDK), undefined)
+    $(error Please ensure ONEP_SDK points to <sdk location> prior to running make. \
+    Example: export ONEP_SDK=/opt/cisco/onep/c64/sdk-c64-0.7.0.503)
+endif
+
+# --------------------------------------
+# Build 32 bit as a default
+# To build 64 bit, update LBITS to 64
+# for setting some FLAGS
+# --------------------------------------
+LBITS ?=64
+ifeq ($(LBITS),64)
+        # compile 64 bit
+        ONEP_LBITS=64
+else
+        # compile 32 bit
+        ONEP_LBITS=32
+endif
+
+# ----------------
+# Common GCC Variables
+# ----------------
+CC := gcc
+
+CC_BLDFLAGS := \
+        -Wall -c -fPIC -m${ONEP_LBITS}
+
+CC_INCDIRS := \
+	-I${TUT_SRC}/SessionElement/include \
+        -I${ONEP_SDK}/c/include
+
+LD_LIBDIRS := \
+        -L${ONEP_SDK}/c/lib
+
+LD_LIBS := \
+        -lonep${ONEP_LBITS}_core -lrt
+
+LD_FLAGS := \
+        -m${ONEP_LBITS}
+

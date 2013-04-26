@@ -1,0 +1,504 @@
+/*
+ * Copyright (c) 2012-2013, Cisco Systems, Inc.
+ *
+ * Cisco Confidential Information.  All rights reserved.
+ *
+ * Redistribution and use in source or binary forms, with or without modification,
+ * is subject to the terms and conditions of the Cisco onePK Software Development Kit 
+ * License Agreement (onePK SDK Internal User License).
+ *
+ */
+
+ 
+/*
+ * Usage: sudo LD_LIBRARY_PATH=/home/cisco/onePK-sdk-c-<version>-lnx-x86_32/c/lib 
+ *              bin/DatapathTutorial -a 10.10.10.199 -u user1 -p pass1
+ * where 10.10.10.199 is the IP address of the network element and
+ * user1 and pass1 are valid credentials on the network element
+ *
+ * This will cause the network element to copy all packets from its first
+ * interface to the application.  The application will print out the copied
+ * packets.
+ * 
+ *
+ * Required Network Element Configuration: 
+ *  username user1 password pass1
+ *  onep
+ *   transport socket
+ *   datapath transport gre interface G0/1 
+ *   !assumes element will send packets back to app over G0/1
+ *   start
+ *
+ * Required Server side tasks
+ * 1) Edit LOCAL_IP in dpss to match IP address on which server expects packets, e.g.
+ *    $grep LOCAL_IP /home/cisco/onePK-sdk-c-<version>-lnx-x86_32/c/bin/dpss.conf
+ *    LOCAL_IP 10.10.10.130
+ * 2) Start dpss_mp:
+ *    sudo LD_LIBRARY_PATH=/home/cisco/onePK-sdk-c-rel-0.7.0.502.V153_1_17_T0_6-lnx-x86_32/c/lib 
+ *        /home/cisco/onePK-sdk-c-<version>-lnx-x86_32/c/bin/dpss_mp_32-0.7.0.502
+ */
+
+#include <limits.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
+#include <netinet/ip.h>
+
+
+#include "onep_core_services.h"
+#include "policy.h"
+#include "datapath_policy.h"
+#include "class.h"
+#include "filter.h"
+#include "onep_dpss_packet_delivery.h"
+#include "onep_types.h"
+#include "onep_dpss_actions.h"
+#include "onep_dpss_pkt.h"
+#include "onep_dpss_flow.h"
+#include "onep_dpss_callback_framework.h"
+#include "session_element_util.h"
+#define FAIL false
+#define SUCCESS true
+
+// START SNIPPET: c_variables
+static network_interface_t *eth0_1 = NULL;
+static ace_t*              ace40;
+static acl_t*              acl; 
+static target_t*           targ = NULL;
+static class_t *           acl_class = NULL;
+static filter_t *          acl_filter = NULL;
+static interface_filter_t* intf_filter = NULL;
+static onep_collection_t*  intfs = NULL;
+static unsigned int        count = 0;
+static network_element_t*  elemA = NULL;
+static onep_status_t       rc;
+static onep_username       user;
+static onep_password       pwd;
+static onep_if_name        name;
+static onep_dpss_handle_t  *dpss_handle;
+static onep_dpss_packet_loop_t *pak_loop;
+static onep_dpss_traffic_reg_t *reg_handle;
+
+static network_application_t* myapp = NULL;
+// END SNIPPET: c_variables
+
+// START SNIPPET: callback_info 
+
+/*
+ * Extract the IP version from a packet.
+ */
+onep_status_t dpss_tutorial_get_ip_version(struct onep_dpss_paktype_ *pakp,
+    char *ip_version) {
+
+    onep_status_t rc;
+    uint16_t l3_protocol;
+    char l3_prot_sym = 'U';
+
+    /* Get packet L3 protocol. */
+    rc = onep_dpss_pkt_get_l3_protocol(pakp, &l3_protocol);
+    if( rc==ONEP_OK ) {
+        if( l3_protocol == ONEP_DPSS_L3_IPV4 ) {
+            l3_prot_sym = '4';
+        } else if( l3_protocol == ONEP_DPSS_L3_IPV6 ) {
+            l3_prot_sym = '6';
+        } else if( l3_protocol == ONEP_DPSS_L3_OTHER ) {
+            l3_prot_sym = 'N';
+        } else {
+            l3_prot_sym = 'U';
+        }
+    }
+    else {
+        return (rc);
+    }
+    *ip_version = l3_prot_sym;
+    return (ONEP_OK);
+}
+
+
+/*
+ * Extract IP addressing and port information from the packet.
+ */
+onep_status_t dpss_tutorial_get_ip_port_info(
+    struct onep_dpss_paktype_ *pakp, char **src_ip, char **dest_ip, 
+    uint16_t *src_port, uint16_t *dest_port, char *prot, char ip_version ) {
+
+    onep_status_t   rc;
+    uint8_t         l4_protocol; 
+    uint8_t         *l3_start;   
+    struct iphdr    *l3hdr;
+    uint8_t         *l4_start;   
+    struct tcphdr   *l4tcp;
+    struct udphdr   *l4udp;
+        
+    if( ip_version == '4' ) {
+        /* get IPv4 header */
+        rc = onep_dpss_pkt_get_l3_start(pakp, &l3_start);
+        if( rc==ONEP_OK ) {
+            l3hdr = (struct iphdr *)l3_start; // convert to iphdr
+            *src_ip = strdup(inet_ntoa( *(struct in_addr *)&(l3hdr->saddr) ));
+            *dest_ip = strdup(inet_ntoa( *(struct in_addr *)&(l3hdr->daddr) ));
+        } else {
+            fprintf(stderr,"Error getting IPv4 header.\n");
+            return (ONEP_ERR_SYSTEM);
+        }
+    } else if( ip_version == '6' ) {
+        fprintf(stderr, "Cannot get IPv6 traffic at this time.\n");
+        return (ONEP_ERR_SYSTEM);
+    } else if( ip_version == 'N' ) {
+        fprintf(stderr, "IP address is neither IPv4 nor IPv6.\n");
+        return (ONEP_ERR_SYSTEM);
+    } else {
+        fprintf(stderr, "Unknown IP version.\n");
+        return (ONEP_ERR_SYSTEM);
+    }
+        
+    /* get L4 header */
+    rc = onep_dpss_pkt_get_l4_start(pakp, &l4_start);
+    if( rc != ONEP_OK ) {
+        fprintf(stderr, "Error getting L4 header.\n");
+        return (rc);
+    }
+        
+    /* get packet L4 protocol */
+    rc = onep_dpss_pkt_get_l4_protocol(pakp, &l4_protocol);
+    if( rc == ONEP_OK ) {
+        if( l4_protocol == ONEP_DPSS_TCP_PROT ) {
+            /* TCP */
+            strcpy(prot,"TCP");
+            l4tcp = (struct tcphdr *)l4_start;
+            *src_port = ntohs( l4tcp->source );
+            *dest_port = ntohs( l4tcp->dest );
+        }
+        else if( l4_protocol == ONEP_DPSS_UDP_PROT ) {
+            /* UDP */
+            strcpy(prot,"UDP");
+            l4udp = (struct udphdr *)l4_start;
+            *src_port = ntohs( l4udp->source );
+            *dest_port = ntohs( l4udp->dest );
+        }
+        else if( l4_protocol == ONEP_DPSS_ICMP_PROT ) {
+            strcpy(prot,"ICMP");
+        }
+        else if( l4_protocol == ONEP_DPSS_IPV6_ENCAPSULATION_PROT ) {
+            // sends IPV6 packet as payload of IPV4
+            strcpy(prot,"ENCP"); // IPV6 encapsulated on IPV4
+        }
+        else {
+            strcpy(prot,"UNK!"); // Unknown!
+        }
+    }
+    else {
+        fprintf(stderr, "Error getting L4 protocol.\n");
+    }
+        
+    return (ONEP_OK);        
+}
+
+
+/*
+ * Extract some flow state given a packet and a FID.
+ */
+void dpss_tutorial_get_flow_state(struct onep_dpss_paktype_ *pakp,
+    onep_dpss_flow_ptr_t fid, char *l4_state_char ) {
+
+    onep_status_t             rc;
+    onep_dpss_l4_flow_state_e l4_state;
+
+    rc = onep_dpss_flow_get_l4_flow_state(pakp,&l4_state);
+    if( rc==ONEP_OK ) {
+        if( l4_state == ONEP_DPSS_L4_CLOSED ) {
+            strcpy(l4_state_char,"CLOSED");
+        } else if( l4_state == ONEP_DPSS_L4_OPENING ) {
+            strcpy(l4_state_char,"OPENING");
+        } else if( l4_state == ONEP_DPSS_L4_UNI_ESTABLISHED ) {
+            strcpy(l4_state_char,"UNI-ESTABLISHED");
+        } else if( l4_state == ONEP_DPSS_L4_UNI_ESTABLISHED_INCORRECT ) {
+            strcpy(l4_state_char,"UNI-ESTABLISHED INCORRECT");
+        } else if( l4_state == ONEP_DPSS_L4_BI_ESTABLISHED ) {
+            strcpy(l4_state_char,"BI-ESTABLISHED");
+        } else if( l4_state == ONEP_DPSS_L4_BI_ESTABLISHED_INCORRECT ) {
+            strcpy(l4_state_char,"BI-ESTABLISHED INCORRECT");
+        } else if( l4_state == ONEP_DPSS_L4_CLOSING ) {
+            strcpy(l4_state_char,"CLOSING");
+        } else {
+            strcpy(l4_state_char,"!UNKNOWN!");
+        }
+    } else { 
+        fprintf(stderr, "Error getting L4 state of flow.\n");
+    }
+    return;
+}
+
+void dpss_display_pak_info_callback(onep_dpss_traffic_reg_t *reg,
+    struct onep_dpss_paktype_ *pak, void *client_context, bool *return_packet) {
+
+    onep_status_t        rc;
+    onep_dpss_flow_ptr_t fid;
+    char                 ipv;
+    uint16_t             src_port = 0;
+    uint16_t             dest_port = 0;
+    char                 *src_ip, *dest_ip;
+    char                 l4_protocol[5];
+    char                 l4_state[30];
+
+    strcpy(l4_protocol,"ERR");
+    strcpy(l4_state,"ERR");
+    
+    rc = onep_dpss_pkt_get_flow(pak, &fid);
+    if( rc== ONEP_OK ) {
+        dpss_tutorial_get_ip_version(pak, &ipv);
+        dpss_tutorial_get_ip_port_info(pak, &src_ip, &dest_ip, &src_port, 
+            &dest_port, l4_protocol, ipv);
+        dpss_tutorial_get_flow_state(pak, fid, l4_state);
+                
+    } else {
+        fprintf(stderr, "Error getting flow ID.\n");
+    }
+    printf(
+        "\n"
+        "\033[22;4;30m"
+        "| FID | IPv | Source                  |"
+        " Destination             | Prot | Pkt# | State                     |\n"
+        "\033[0m");
+    printf(
+      "| %-3d |  %c  | %-15s : %-5d | %-15s : %-5d | %-4s | %-25s |\n\n",
+      fid, ipv, src_ip, src_port, dest_ip, dest_port,
+      l4_protocol, l4_state);
+    free(src_ip);
+    free(dest_ip);
+    return;
+}
+// END SNIPPET: callback_info 
+
+void free_resources() {
+    // Free resources
+    if (elemA)         (void) onep_element_destroy(&elemA);
+    if (myapp)         (void) onep_application_destroy(&myapp);
+}
+
+
+/* Main application  */
+int main (int argc, char* argv[]) {
+	session_handle_t* shA = NULL;
+    memset(user, 0, ONEP_USERNAME_SIZE);
+    memset(pwd,  0, ONEP_PASSWORD_SIZE);
+    parse_command_line(argc, argv);
+    strncpy(user, get_login_username(), ONEP_USERNAME_SIZE-1);
+    strncpy(pwd,  get_login_password(), ONEP_PASSWORD_SIZE-1);
+    fprintf(stderr,"start connection.\n");
+    fprintf(stderr, "\n********* CONNECT *******\n");
+        shA = connect_network_element(get_element_address(), 
+                user, pwd, "Discovering OnePK Services Tutorial", &elemA);
+        if (!shA) {
+            fprintf(stderr, 
+                    "\n******** connect_network_element fails ********\n\n"); 
+    	    return ONEP_FAIL;
+        }
+    fprintf(stderr,"connected.\n");
+
+
+
+    /* Create a class which defines what traffic the application wishes to
+     * receive from a specific interface.  The traffic class is specified
+     * using the Datapath Policy Service Set.  
+     */
+   
+    /* The first step is to create an access list entry that defines the traffic
+     * that we care about.  In this case it is the equivalent of the CLI
+     * "access-list 40 permit ip any any".  This object is created locally, 
+     * so no network element scoping is required.
+     */
+// START SNIPPET: get_class     
+    rc = onep_acl_create_l3_ace(40, TRUE, &ace40); 
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to create l3 ace: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    rc = onep_acl_set_l3_ace_src_prefix(ace40, NULL, 0);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to set source prefix: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    rc = onep_acl_set_l3_ace_dst_prefix(ace40, NULL, 0);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to set dest prefix: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    rc = onep_acl_set_l3_ace_protocol(ace40, 0x100 /* Magic value */);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to set protocol: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    rc = onep_acl_set_l3_ace_src_port(ace40, 0, ONEP_COMPARE_ANY);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to set source port: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+    
+    rc = onep_acl_set_l3_ace_dst_port(ace40, 0, ONEP_COMPARE_ANY);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to set dest port: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    /* Now create the related ACL.  After creating the ACL we will add 
+     * ace40 to it. 
+     */
+    rc = onep_acl_create_l3_acl(AF_INET, elemA, &acl); 
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to create acl: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    rc = onep_acl_add_ace(acl, ace40); 
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to add ace to acl: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    /* Now that the ACL is created, we can create a class map with an  
+     * ACL filter.  
+     */
+    rc = onep_policy_create_class(elemA, ONEP_CLASS_OPER_OR, &acl_class);  
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to create class: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    /* Create an acl filter containing the acl created above. 
+     */
+    rc = onep_policy_create_acl_filter(acl, &acl_filter);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to create acl filter: %s\n", onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    /* Now add the ACL filter to the created acl_class. 
+     */
+    rc = onep_policy_add_class_filter(acl_class, acl_filter);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to add filter to class: %s\n", 
+                onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+// END SNIPPET: get_class
+
+    /* 
+     * Start up a packet loop. Need before registering callback. 
+     */
+// START SNIPPET: packet_loop 
+
+    // Packet loop is defined as onep_dpss_packet_loop_t *pak_loop;
+
+    rc=onep_dpss_packet_loop_start(1, &pak_loop);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to start packet loop: %s\n", 
+                onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+// END SNIPPET: packet_loop 
+
+// START SNIPPET: dpss_initialize 
+
+    // dpss_handle is defined as static onep_dpss_handle_t  *dpss_handle;
+
+    /* 
+     * Initialize DPSS, get back an assigned packet handle.
+     */
+    rc = onep_dpss_initialize(&dpss_handle, "dpss_tutorial", elemA);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to initialize dpss: %s\n", 
+                onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+// END SNIPPET: dpss_initialize 
+
+// START SNIPPET: dpss_register
+
+    /* 
+     * Register packet loop with dpss_handle.
+     */
+    rc = onep_dpss_packet_loop_register_dpss_handle(pak_loop, dpss_handle);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to register packet loop with dpss: %s\n", 
+                onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+// END SNIPPET: dpss_register
+
+// START SNIPPET: get_interface 
+    /*
+     * Get list of interfaces on device, then find the interface we want.
+     */
+    onep_interface_filter_new(&intf_filter);
+    rc = onep_element_get_interface_list(elemA, intf_filter, &intfs);
+
+    rc = onep_collection_get_size(intfs, &count);
+    if (count <= 0 ) {
+        fprintf(stderr, "\nNo interfaces available");
+        return ONEP_FAIL;
+    }
+
+    /* 1 for the second argument in the next call indicates
+     * Ethernet0/1 in the network simulator setup.
+     */
+    rc = onep_collection_get_by_index(intfs, 1, (void *)&eth0_1);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "\nFailed to get eth0_1 during setup "
+                        "code[%d], text[%s]\n", rc, onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    rc = onep_interface_get_name(eth0_1, name);
+
+// END SNIPPET: get_interface 
+
+// START SNIPPET: register_packets 
+    /* 
+     * Apply class to found interface. 
+     */
+    rc = onep_policy_create_interface_target(eth0_1,
+                        ONEP_TARGET_LOCATION_HARDWARE_DEFINED_INPUT, &targ);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to create interface target: %s\n", 
+                onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+
+    rc = onep_dpss_register_for_packets(dpss_handle, targ, acl_class,
+                        ONEP_DPSS_ACTION_COPY, dpss_display_pak_info_callback,
+                        0, &reg_handle);
+    if (rc != ONEP_OK) {
+        fprintf(stderr, "Unable to register for packets: %s\n",
+                onep_strerror(rc));
+        return ONEP_FAIL;
+    }
+    printf ("Registered for packets on interface %s\n", name);
+// END SNIPPET: register_packets 
+
+
+    printf("Press Enter to end program.\n");
+    getchar();
+
+    /* Need to free dpss items.
+     *
+     */
+    onep_dpss_deregister_for_packets(reg_handle);
+    rc = onep_dpss_destroy(dpss_handle);
+
+    free_resources();
+    return SUCCESS;
+}
+
