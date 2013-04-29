@@ -16,9 +16,3 @@
 *.exe
 *.out
 *.app
-
-#scripts
-*.sh
-
-#vim temp
-*.c~
